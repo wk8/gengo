@@ -68,10 +68,9 @@ limitations under the License.
 package main
 
 import (
-	"k8s.io/gengo/args"
-
 	"k8s.io/klog"
 
+	"k8s.io/gengo/args"
 	"k8s.io/gengo/examples/conversion-gen/generators"
 )
 
