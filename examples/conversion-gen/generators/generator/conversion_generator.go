@@ -64,7 +64,7 @@ type ConversionGenerator struct {
 	// see comment on WithUnsupportedTypesHandler
 	unsupportedTypesHandler func(inVar, outVar NamedVariable, sw *generator.SnippetWriter) error
 	// see comment on WithExternalConversionsHandler
-	externalConversionsHandler func(inVar, outVar NamedVariable, sw *generator.SnippetWriter) error
+	externalConversionsHandler func(inVar, outVar NamedVariable, sw *generator.SnippetWriter) (bool, error)
 }
 
 // NewConversionGenerator builds a new ConversionGenerator.
@@ -212,9 +212,11 @@ func (g *ConversionGenerator) WithUnsupportedTypesHandler(handler func(inVar, ou
 // The handler can also choose to panic to stop the generation altogether, e.g. by calling
 // klog.Fatalf.
 // If this is not set, missing fields are silently ignored.
+// The boolean returned by the handler should indicate whether it has written code to handle
+// the conversion.
 // Note that the snippet writer's context is that of the generator (in particular, it can use
 // any namers defined by the generator).
-func (g *ConversionGenerator) WithExternalConversionsHandler(handler func(inVar, outVar NamedVariable, sw *generator.SnippetWriter) error) *ConversionGenerator {
+func (g *ConversionGenerator) WithExternalConversionsHandler(handler func(inVar, outVar NamedVariable, sw *generator.SnippetWriter) (bool, error)) *ConversionGenerator {
 	g.externalConversionsHandler = handler
 	return g
 }
@@ -405,10 +407,10 @@ func (g *ConversionGenerator) doMap(inType, outType *types.Type, sw *generator.S
 
 			if function, ok := g.preexists(inType.Elem, outType.Elem); ok {
 				manualOrInternal = true
-				sw.Do("if err := $.|"+rawNamer+"$(&val, newVal, s); err != nil {\n", function)
+				sw.Do("if err := $.|"+rawNamer+"$(&val, newVal"+g.extraArgumentsString()+"); err != nil {\n", function)
 			} else if g.convertibleOnlyWithinPackage(inType.Elem, outType.Elem) {
 				manualOrInternal = true
-				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&val, newVal, s); err != nil {\n",
+				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&val, newVal"+g.extraArgumentsString()+"); err != nil {\n",
 					argsFromType(inType.Elem, outType.Elem))
 			}
 
@@ -417,7 +419,7 @@ func (g *ConversionGenerator) doMap(inType, outType *types.Type, sw *generator.S
 			} else if g.externalConversionsHandler == nil {
 				klog.Warningf("%s's values of type %s require manual conversion to external type %s",
 					inType.Name, inType.Elem, outType.Name)
-			} else if err := g.externalConversionsHandler(NewNamedVariable("&val", inType.Elem), NewNamedVariable("newVal", outType.Elem), sw); err != nil {
+			} else if _, err := g.externalConversionsHandler(NewNamedVariable("&val", inType.Elem), NewNamedVariable("newVal", outType.Elem), sw); err != nil {
 				errors = append(errors, err)
 			}
 
@@ -454,20 +456,30 @@ func (g *ConversionGenerator) doSlice(inType, outType *types.Type, sw *generator
 
 			if function, ok := g.preexists(inType.Elem, outType.Elem); ok {
 				manualOrInternal = true
-				sw.Do("if err := $.|"+rawNamer+"$(&(*in)[i], &(*out)[i], s); err != nil {\n", function)
+				sw.Do("if err := $.|"+rawNamer+"$(&(*in)[i], &(*out)[i]"+g.extraArgumentsString()+"); err != nil {\n", function)
 			} else if g.convertibleOnlyWithinPackage(inType.Elem, outType.Elem) {
 				manualOrInternal = true
-				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&(*in)[i], &(*out)[i], s); err != nil {\n",
+				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&(*in)[i], &(*out)[i]"+g.extraArgumentsString()+"); err != nil {\n",
 					argsFromType(inType.Elem, outType.Elem))
 			}
 
 			if manualOrInternal {
 				sw.Do("return err\n}\n", nil)
-			} else if g.externalConversionsHandler == nil {
-				klog.Warningf("%s's items of type %s require manual conversion to external type %s",
-					inType.Name, inType.Name, outType.Name)
-			} else if err := g.externalConversionsHandler(NewNamedVariable("&(*in)[i]", inType.Elem), NewNamedVariable("&(*out)[i]", outType.Elem), sw); err != nil {
-				errors = append(errors, err)
+			} else {
+				conversionHandled := false
+				var err error
+
+				if g.externalConversionsHandler == nil {
+					klog.Warningf("%s's items of type %s require manual conversion to external type %s",
+						inType.Name, inType.Name, outType.Name)
+				} else if conversionHandled, err = g.externalConversionsHandler(NewNamedVariable("&(*in)[i]", inType.Elem), NewNamedVariable("&(*out)[i]", outType.Elem), sw); err != nil {
+					errors = append(errors, err)
+				}
+
+				if !conversionHandled {
+					// so that the compiler doesn't barf
+					sw.Do("_ = i\n", nil)
+				}
 			}
 		}
 		sw.Do("}\n", nil)
@@ -532,7 +544,7 @@ func (g *ConversionGenerator) doStruct(inType, outType *types.Type, sw *generato
 			}
 			if !g.functionHasTag(function, "copy-only") || !isFastConversion(inMemberType, outMemberType) {
 				args["function"] = function
-				sw.Do("if err := $.function|"+rawNamer+"$(&in.$.name$, &out.$.name$, s); err != nil {\n", args)
+				sw.Do("if err := $.function|"+rawNamer+"$(&in.$.name$, &out.$.name$"+g.extraArgumentsString()+"); err != nil {\n", args)
 				sw.Do("return err\n", nil)
 				sw.Do("}\n", nil)
 				continue
@@ -576,7 +588,7 @@ func (g *ConversionGenerator) doStruct(inType, outType *types.Type, sw *generato
 				continue
 			}
 			if g.convertibleOnlyWithinPackage(inMemberType, outMemberType) {
-				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&in.$.name$, &out.$.name$, s); err != nil {\n", args)
+				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&in.$.name$, &out.$.name$"+g.extraArgumentsString()+"); err != nil {\n", args)
 				sw.Do("return err\n}\n", nil)
 			} else {
 				errors = g.callExternalConversionsHandlerForStructField(inType, outType, inMemberType, outMemberType, &inMember, &outMember, sw, errors)
@@ -590,7 +602,7 @@ func (g *ConversionGenerator) doStruct(inType, outType *types.Type, sw *generato
 				}
 			} else {
 				if g.convertibleOnlyWithinPackage(inMemberType, outMemberType) {
-					sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&in.$.name$, &out.$.name$, s); err != nil {\n", args)
+					sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&in.$.name$, &out.$.name$"+g.extraArgumentsString()+"); err != nil {\n", args)
 					sw.Do("return err\n}\n", nil)
 				} else {
 					errors = g.callExternalConversionsHandlerForStructField(inType, outType, inMemberType, outMemberType, &inMember, &outMember, sw, errors)
@@ -598,7 +610,7 @@ func (g *ConversionGenerator) doStruct(inType, outType *types.Type, sw *generato
 			}
 		default:
 			if g.convertibleOnlyWithinPackage(inMemberType, outMemberType) {
-				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&in.$.name$, &out.$.name$, s); err != nil {\n", args)
+				sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(&in.$.name$, &out.$.name$"+g.extraArgumentsString()+"); err != nil {\n", args)
 				sw.Do("return err\n}\n", nil)
 			} else {
 				errors = g.callExternalConversionsHandlerForStructField(inType, outType, inMemberType, outMemberType, &inMember, &outMember, sw, errors)
@@ -615,7 +627,7 @@ func (g *ConversionGenerator) callExternalConversionsHandlerForStructField(inTyp
 	} else {
 		inVar := NewNamedVariable(fmt.Sprintf("&in.%s", inMember.Name), inMemberType)
 		outVar := NewNamedVariable(fmt.Sprintf("&out.%s", outMember.Name), outMemberType)
-		if err := g.externalConversionsHandler(inVar, outVar, sw); err != nil {
+		if _, err := g.externalConversionsHandler(inVar, outVar, sw); err != nil {
 			errors = append(errors, err)
 		}
 	}
@@ -635,10 +647,10 @@ func (g *ConversionGenerator) doPointer(inType, outType *types.Type, sw *generat
 
 		if function, ok := g.preexists(inType.Elem, outType.Elem); ok {
 			manualOrInternal = true
-			sw.Do("if err := $.|"+rawNamer+"$(*in, *out, s); err != nil {\n", function)
+			sw.Do("if err := $.|"+rawNamer+"$(*in, *out"+g.extraArgumentsString()+"); err != nil {\n", function)
 		} else if g.convertibleOnlyWithinPackage(inType.Elem, outType.Elem) {
 			manualOrInternal = true
-			sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(*in, *out, s); err != nil {\n", argsFromType(inType.Elem, outType.Elem))
+			sw.Do("if err := "+conversionFunctionNameTemplate(publicImportTrackingNamer)+"(*in, *out"+g.extraArgumentsString()+"); err != nil {\n", argsFromType(inType.Elem, outType.Elem))
 		}
 
 		if manualOrInternal {
@@ -646,7 +658,7 @@ func (g *ConversionGenerator) doPointer(inType, outType *types.Type, sw *generat
 		} else if g.externalConversionsHandler == nil {
 			klog.Warningf("%s's values of type %s require manual conversion to external type %s",
 				inType.Name, inType.Elem, outType.Name)
-		} else if err := g.externalConversionsHandler(NewNamedVariable("*in", inType), NewNamedVariable("*out", outType), sw); err != nil {
+		} else if _, err := g.externalConversionsHandler(NewNamedVariable("*in", inType), NewNamedVariable("*out", outType), sw); err != nil {
 			errors = append(errors, err)
 		}
 	}
@@ -665,6 +677,14 @@ func (g *ConversionGenerator) doUnknown(inType, outType *types.Type, sw *generat
 		return []error{err}
 	}
 	return nil
+}
+
+func (g *ConversionGenerator) extraArgumentsString() string {
+	result := ""
+	for _, namedArgument := range g.manualConversionsTracker.additionalConversionArguments {
+		result += ", " + namedArgument.Name
+	}
+	return result
 }
 
 // GetPeerTypeFor returns the peer type for type t.
