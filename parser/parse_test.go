@@ -24,6 +24,10 @@ import (
 	"testing"
 	"text/template"
 
+	"github.com/davecgh/go-spew/spew"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
 	"k8s.io/gengo/args"
 	"k8s.io/gengo/namer"
 	"k8s.io/gengo/parser"
@@ -154,6 +158,25 @@ func TestBuilder(t *testing.T) {
                 var (
 	                AnotherVar = Frobber{}
                 )
+
+		type Enumeration string
+		const (
+			EnumSymbol Enumeration = "enumSymbolValue"
+		)
+
+		type Degrees int
+		const (
+			FirstDegree Degrees = iota
+			SecondDegree
+			ThirdDegree
+		)
+
+		const ConstNineNine = 99
+		const ConstHundred = ConstNineNine + 1
+
+		const ConstExpr = 1 - 0.707i * 9.3
+		const ConstFloat = float64(7.8)
+		const ConstString = "constant string"
                 `,
 		},
 	}
@@ -172,12 +195,17 @@ package o
 {{define "Var"}}{{$t := .Underlying}}var {{Name .}} {{Raw $t}} = {{Raw .}}
 
 {{end}}
+{{define "Const"}}{{$t := .Underlying}}const {{Name .}} {{Raw $t}} = {{Raw .}}({{ .ConstValue }})
+
+{{end}}
 {{range $t := .}}{{if eq $t.Kind "Struct"}}{{template "Struct" $t}}{{end}}{{end}}
 {{range $t := .}}{{if eq $t.Kind "DeclarationOf"}}{{if eq $t.Underlying.Kind "Func"}}{{template "Func" $t}}{{end}}{{end}}{{end}}
-{{range $t := .}}{{if eq $t.Kind "DeclarationOf"}}{{if ne $t.Underlying.Kind "Func"}}{{template "Var" $t}}{{end}}{{end}}{{end}}`
+{{range $t := .}}{{if eq $t.Kind "DeclarationOf"}}{{if eq $t.Underlying.Kind "Struct"}}{{template "Var" $t}}{{end}}{{end}}{{end}}
+{{range $t := .}}{{if eq $t.Kind "DeclarationOf"}}{{if eq $t.Underlying.Kind "Alias"}}{{template "Const" $t}}{{end}}{{end}}{{end}}`
 
 	var expect = `
 package o
+
 
 
 
@@ -215,6 +243,15 @@ var FooAVar proto.Frobber = proto.AVar
 
 var FooAnotherVar proto.Frobber = proto.AnotherVar
 
+
+const FooEnumSymbol proto.Enumeration = proto.EnumSymbol(enumSymbolValue)
+
+const FooFirstDegree proto.Degrees = proto.FirstDegree(0)
+
+const FooSecondDegree proto.Degrees = proto.SecondDegree(1)
+
+const FooThirdDegree proto.Degrees = proto.ThirdDegree(2)
+
 `
 	testNamer := namer.NewPublicNamer(1, "proto")
 	rawNamer := namer.NewRawNamer("o", nil)
@@ -232,10 +269,75 @@ var FooAnotherVar proto.Frobber = proto.AnotherVar
 	buf := &bytes.Buffer{}
 	tmpl.Execute(buf, o)
 	if e, a := expect, buf.String(); e != a {
-		t.Errorf("Wanted, got:\n%v\n-----\n%v\n", e, a)
+		cmp.Diff(e, a)
+		t.Errorf("Wanted, got:\n%v\n-----\n%v\nDiff:\n%s", e, a, cmp.Diff(e, a))
 	}
 	if p := u.Package("base/foo/proto"); !p.HasImport("base/common/proto") {
 		t.Errorf("Unexpected lack of import line: %#v", p.Imports)
+	}
+
+	strPtr := func(s string) *string { return &s }
+
+	expectedConst := map[string]*types.Type{
+		"EnumSymbol": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "EnumSymbol"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("enumSymbolValue"),
+		},
+		"FirstDegree": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "FirstDegree"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("0"),
+		},
+		"SecondDegree": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "SecondDegree"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("1"),
+		},
+		"ThirdDegree": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "ThirdDegree"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("2"),
+		},
+		"ConstNineNine": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "ConstNineNine"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("99"),
+		},
+		"ConstHundred": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "ConstHundred"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("100"),
+		},
+		"ConstFloat": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "ConstFloat"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("7.8"),
+		},
+		"ConstExpr": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "ConstExpr"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("(1 + -6.5751i)"),
+		},
+		"ConstString": &types.Type{
+			Name:       types.Name{Package: "base/foo/proto", Name: "ConstString"},
+			Kind:       types.DeclarationOf,
+			ConstValue: strPtr("constant string"),
+		},
+	}
+
+	if diff := cmp.Diff(
+		u.Package("base/foo/proto").Constants, expectedConst,
+		cmpopts.IgnoreFields(types.Type{}, "Underlying"),
+		cmpopts.IgnoreFields(types.Type{}, "CommentLines"),
+		cmpopts.IgnoreFields(types.Type{}, "SecondClosestCommentLines"),
+	); diff != "" {
+		t.Errorf("Constant mismatch: %s", diff)
+	}
+
+	if len(u.Package("base/foo/proto").Constants) != len(expectedConst) {
+		t.Errorf("Wanted %d constants, got: %s",
+			len(expectedConst), spew.Sdump(u.Package("base/foo/proto").Constants))
 	}
 }
 
@@ -327,6 +429,219 @@ func TestParseSecondClosestCommentLines(t *testing.T) {
 	}
 }
 
+func TestParseMethodParameterAndResultNames(t *testing.T) {
+	const fileName = "base/foo/proto/foo.go"
+	testCases := []struct {
+		testFile            file
+		expectedParamNames  map[string][]string
+		expectedResultNames map[string][]string
+	}{
+		{
+			testFile: file{
+				path: fileName, contents: `
+				    package foo
+
+					type bar struct{} 
+
+                    func (b *bar) SingleParam(param1 int) {}
+                    func (b *bar) MultipleParams(param1, param2 int) {}
+                    func (b *bar) SingleParamSingleResult(param1 int) (out1 bool) {}
+                    func (b *bar) MultipleParamsMultipleResults(param1 bool, param2 int) (out1 bool, out2 string) {}
+					func (b *bar) NoParamsMultipleResults() (out1 bool, out2 string) {}
+					func (b *bar) NoParamsSingleResults() (out1 bool) {}
+					func (b *bar) NoParamsNoResults() {}
+					func (b *bar) UnnamedSingleParamNoResults(int) {}
+					func (b *bar) UnnamedMultipleParamsNoResult(int, bool) {}
+					func (b *bar) NoParamsSingleUnnamedResults() int {}
+					func (b *bar) NoParamsMultipleUnnamedResults() (int, string) {}
+                    `},
+			expectedParamNames: map[string][]string{
+				"SingleParam":                    {"param1"},
+				"MultipleParams":                 {"param1", "param2"},
+				"SingleParamSingleResult":        {"param1"},
+				"MultipleParamsMultipleResults":  {"param1", "param2"},
+				"NoParamsMultipleResults":        nil,
+				"NoParamsSingleResults":          nil,
+				"NoParamsNoResults":              nil,
+				"UnnamedSingleParamNoResults":    {""},
+				"UnnamedMultipleParamsNoResult":  {"", ""},
+				"NoParamsSingleUnnamedResults":   nil,
+				"NoParamsMultipleUnnamedResults": nil,
+			},
+			expectedResultNames: map[string][]string{
+				"SingleParam":                    nil,
+				"MultipleParams":                 nil,
+				"SingleParamSingleResult":        {"out1"},
+				"MultipleParamsMultipleResults":  {"out1", "out2"},
+				"NoParamsMultipleResults":        {"out1", "out2"},
+				"NoParamsSingleResults":          {"out1"},
+				"NoParamsNoResults":              nil,
+				"UnnamedSingleParamNoResults":    nil,
+				"UnnamedMultipleParamsNoResult":  nil,
+				"NoParamsSingleUnnamedResults":   {""},
+				"NoParamsMultipleUnnamedResults": {"", ""},
+			},
+		},
+	}
+	for _, test := range testCases {
+		_, u, o := construct(t, []file{test.testFile}, namer.NewPublicNamer(0))
+		t.Logf("%#v", o)
+		blahT := u.Type(types.Name{Package: "base/foo/proto", Name: "bar"})
+
+		for methodName, methodType := range blahT.Methods {
+			expectedParamNames := test.expectedParamNames[methodName]
+			actualParamNames := methodType.Signature.ParameterNames
+			if !reflect.DeepEqual(expectedParamNames, actualParamNames) {
+				t.Errorf("%s param names parsed incorrectly wrong, wanted %v, got %v", methodName, expectedParamNames,
+					actualParamNames)
+			}
+
+			expectedResultNames := test.expectedResultNames[methodName]
+			actualResultNames := methodType.Signature.ResultNames
+			if !reflect.DeepEqual(expectedResultNames, actualResultNames) {
+				t.Errorf("%s result names parsed incorrectly wrong, wanted %v, got %v", methodName, expectedResultNames,
+					actualResultNames)
+			}
+		}
+
+	}
+}
+
+func TestParseMethodCommentLines(t *testing.T) {
+	const fileName = "base/foo/proto/foo.go"
+	testCases := []struct {
+		testFile file
+		expected []string
+	}{
+		{
+			testFile: file{
+				path: fileName, contents: `
+				    package foo
+
+                    type Blah struct {
+	                    a int
+                    }
+
+                    // BlahFunc's CommentLines.
+                    // Another line.
+                    func (b *Blah) BlahFunc() {}
+                    `},
+			expected: []string{"BlahFunc's CommentLines.", "Another line."},
+		},
+		{
+			testFile: file{
+				path: fileName, contents: `
+				    package foo
+
+                    type Blah interface {
+	                    // BlahFunc's CommentLines.
+	                    // Another line.
+	                    BlahFunc()
+                    }
+                    `},
+			expected: []string{"BlahFunc's CommentLines.", "Another line."},
+		},
+	}
+	for _, test := range testCases {
+		_, u, o := construct(t, []file{test.testFile}, namer.NewPublicNamer(0))
+		t.Logf("%#v", o)
+		blahT := u.Type(types.Name{Package: "base/foo/proto", Name: "Blah"})
+		blahM := blahT.Methods["BlahFunc"]
+		if e, a := test.expected, blahM.CommentLines; !reflect.DeepEqual(e, a) {
+			t.Errorf("method comment wrong, wanted %q, got %q", e, a)
+		}
+	}
+
+	signatureTestCases := []struct {
+		testFile file
+		expected []string
+	}{
+		{
+			testFile: file{
+				path: fileName, contents: `
+				    package foo
+
+                    type Blah struct {
+	                    a int
+                    }
+
+                    // Method1 CommentLines.
+                    func (b *Blah) Method1(sameArg int) {}
+
+					// Method2 CommentLines.
+                    func (b *Blah) Method2(sameArg int) {}
+                    `},
+		},
+		{
+			testFile: file{
+				path: fileName, contents: `
+				    package foo
+
+                    type Blah interface {
+						// Method1 CommentLines.
+						Method1(sameArg int) error
+
+						// Method2 CommentLines.
+						Method2(sameArg int) error
+                    }
+                    `},
+		},
+	}
+	for _, test := range signatureTestCases {
+		_, u, o := construct(t, []file{test.testFile}, namer.NewPublicNamer(0))
+		t.Logf("%#v", o)
+		blahT := u.Type(types.Name{Package: "base/foo/proto", Name: "Blah"})
+		blahM1 := blahT.Methods["Method1"]
+		blahM2 := blahT.Methods["Method2"]
+		c1 := blahM1.CommentLines
+		c2 := blahM2.CommentLines
+		if reflect.DeepEqual(c1, c2) {
+			t.Errorf("same signature method comment got equal, %v == %v", c1, c2)
+		}
+	}
+}
+
+func TestParseConstantCommentLines(t *testing.T) {
+	testFile := file{
+		path: "base/foo/proto/foo.go",
+		contents: `
+package foo
+
+// FooString is a string of foo.
+type FooString string
+
+// FooStringOne is one foo.
+const FooStringOne FooString = "One"
+
+// An important integer.
+// This one is nine.
+const OtherInt = 9
+`,
+	}
+
+	expectComment := func(obj *types.Type, lines []string) {
+		t.Helper()
+		if !reflect.DeepEqual(obj.CommentLines, lines) {
+			t.Errorf("wrong const comment for %q: wanted %q, got %q",
+				obj.Name,
+				lines, obj.CommentLines,
+			)
+		}
+	}
+
+	_, u, _ := construct(t, []file{testFile}, namer.NewPublicNamer(0))
+
+	expectComment(
+		u.Constant(types.Name{Package: "base/foo/proto", Name: "FooStringOne"}),
+		[]string{"FooStringOne is one foo."},
+	)
+
+	expectComment(
+		u.Constant(types.Name{Package: "base/foo/proto", Name: "OtherInt"}),
+		[]string{"An important integer.", "This one is nine."},
+	)
+}
+
 func TestTypeKindParse(t *testing.T) {
 	var testFiles = []file{
 		{path: "a/foo.go", contents: "package a\ntype Test string\n"},
@@ -356,6 +671,11 @@ func TestTypeKindParse(t *testing.T) {
             type Test func(a, b string) (c, d string)
             func (t Test) Method(a, b string) (c, d string) { return t(a, b) }
             type Interface interface{Method(a, b string) (c, d string)}
+            `},
+		{path: "h/foo.go", contents: `
+            package h
+            import "a"
+            type Test [1]a.Test
             `},
 	}
 
@@ -397,6 +717,10 @@ func TestTypeKindParse(t *testing.T) {
 		{
 			Package: "g", Name: "Interface", k: types.Interface,
 			names: []string{"Interface", "GInterface", "interface", "gInterface", "g.Interface"},
+		},
+		{
+			Package: "h", Name: "Test", k: types.Array,
+			names: []string{"Test", "HTest", "test", "hTest", "h.Test"},
 		},
 		{
 			Package: "", Name: "string", k: types.Builtin,
